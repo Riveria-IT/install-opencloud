@@ -3,19 +3,57 @@ set -e
 
 echo "✅ OpenCloud Installer"
 
-# Auswahlmenü
+# Alte Installation prüfen
+echo "🔎 Überprüfe bestehende OpenCloud-Installation..."
+if docker ps -a --format '{{.Names}}' | grep -q opencloud; then
+  echo "⚠️  Es sieht so aus, als wäre OpenCloud bereits installiert!"
+  read -rp "❓ Alte Installation jetzt vollständig entfernen? (j/n): " CONFIRM
+  if [[ "$CONFIRM" =~ ^[Jj]$ ]]; then
+    echo "🧹 Entferne alte Container, Volumes & Konfiguration..."
+
+    docker compose -f /opt/opencloud/docker-compose.yml down --volumes || true
+    sudo rm -rf /opt/opencloud || true
+
+    docker compose -f ~/opencloud/deployments/examples/opencloud_full/docker-compose.yml down --volumes || true
+    sudo rm -rf ~/opencloud || true
+
+    sudo rm -f /etc/caddy/Caddyfile
+    sudo systemctl restart caddy || true
+
+    echo "✅ Alte Installation wurde entfernt."
+  else
+    echo "❌ Abgebrochen. Bitte Script beenden oder manuell bereinigen."
+    exit 1
+  fi
+fi
+
+# Auswahl
+echo
 echo "1) Minimal (Rolling, lokal über Caddy)"
 echo "2) Voll (opencloud_full mit Domains und Traefik)"
 read -rp "Wähle Version (1/2): " MODE
 
 read -rp "📍 Server-IP oder Hostname (für Zertifikate/Domains): " HOST
 
-# Pakete installieren
-sudo apt update
-sudo apt install -y docker.io docker-compose caddy git curl
+# Pakete + Caddy-Repo
+echo "📦 Installiere Abhängigkeiten..."
 
+sudo apt update
+sudo apt install -y curl git gnupg2 docker.io docker-compose debian-keyring debian-archive-keyring
+
+if ! command -v caddy >/dev/null 2>&1; then
+  echo "➕ Füge offizielles Caddy-Repository hinzu..."
+  curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+  curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | \
+    sed 's#^deb #deb [signed-by=/usr/share/keyrings/caddy-stable-archive-keyring.gpg] #' | \
+    sudo tee /etc/apt/sources.list.d/caddy-stable.list > /dev/null
+  sudo apt update
+  sudo apt install -y caddy
+fi
+
+# MINIMAL
 if [[ "$MODE" == "1" ]]; then
-  echo "🎯 Minimal-Setup..."
+  echo "🎯 Starte Minimal-Setup..."
 
   sudo mkdir -p /opt/opencloud && cd /opt/opencloud
 
@@ -54,11 +92,13 @@ $HOST {
 }
 EOF
 
+  sudo systemctl enable --now caddy
   sudo systemctl restart caddy
   echo "✅ Minimal-Setup abgeschlossen: https://$HOST"
 
+# FULL
 else
-  echo "🎯 Voll-Setup (Full Beispiel von OpenCloud Compose)..."
+  echo "🎯 Starte Voll-Setup..."
 
   cd ~
   git clone https://github.com/opencloud-eu/opencloud.git || {
@@ -67,7 +107,6 @@ else
   }
 
   cd opencloud/deployments/examples/opencloud_full
-
   cp .env.example .env
 
   sed -i "s/cloud.YOUR.DOMAIN/cloud.$HOST/g" .env
@@ -79,7 +118,7 @@ else
   sed -i "s/WOPISERVER_DOMAIN=.*/WOPISERVER_DOMAIN=wopiserver.$HOST/" .env
   sed -i "s/TRAEFIK_DOMAIN=.*/TRAEFIK_DOMAIN=traefik.$HOST/" .env
 
-  # Optional: lokale Namensauflösung
+  # Optionale Hosts-Datei
   sudo tee -a /etc/hosts <<EOF
 127.0.0.1 cloud.$HOST
 127.0.0.1 traefik.$HOST
@@ -87,9 +126,10 @@ else
 127.0.0.1 wopiserver.$HOST
 EOF
 
-  echo "🔍 .env ist konfiguriert, starte Deployment"
+  echo "🔍 .env ist konfiguriert – starte Deployment"
   sudo docker compose up -d
   echo "✅ Voll-Setup läuft unter: https://cloud.$HOST"
 fi
 
+echo
 echo "ℹ️ Logs anzeigen: sudo docker logs -f opencloud"
