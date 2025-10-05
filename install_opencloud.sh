@@ -1,87 +1,119 @@
-#!/bin/bash
-set -e
+#!/usr/bin/env bash
+set -euo pipefail
 
-echo "✅ OpenCloud Installer"
+echo "✅ OpenCloud Installer (Minimal via Caddy ODER Full via Traefik/Compose)"
+echo "   Getestet auf Debian/Ubuntu (root/sudo benötigt)"
 
-# Alte Installation prüfen
-echo "🔎 Überprüfe bestehende OpenCloud-Installation..."
-if docker ps -a --format '{{.Names}}' | grep -q opencloud; then
-  echo "⚠️  Es sieht so aus, als wäre OpenCloud bereits installiert!"
-  read -rp "❓ Alte Installation jetzt vollständig entfernen? (j/n): " CONFIRM
-  if [[ "$CONFIRM" =~ ^[Jj]$ ]]; then
-    echo "🧹 Entferne alte Container, Volumes & Konfiguration..."
+# ---------- helpers ----------
+need_cmd() { command -v "$1" >/dev/null 2>&1 || return 1; }
+confirm() { read -rp "$1 (j/N): " _a; [[ "${_a:-N}" =~ ^[JjYy]$ ]]; }
 
-    docker compose -f /opt/opencloud/docker-compose.yml down --volumes || true
+# ---------- preflight ----------
+if ! need_cmd sudo; then
+  echo "❌ sudo fehlt. Bitte sudo installieren/konfigurieren."
+  exit 1
+fi
+
+echo "🔎 Prüfe bestehende OpenCloud-Container/Stacks ..."
+if docker ps -a --format '{{.Names}}' | grep -Eq '^opencloud$'; then
+  echo "⚠️  Es existiert ein Container namens 'opencloud'."
+  if confirm "❓ Alte Minimal-Installation jetzt entfernen?"; then
+    sudo docker rm -f opencloud || true
     sudo rm -rf /opt/opencloud || true
-
-    docker compose -f ~/opencloud/deployments/examples/opencloud_full/docker-compose.yml down --volumes || true
-    sudo rm -rf ~/opencloud || true
-
-    sudo rm -f /etc/caddy/Caddyfile
-    sudo systemctl restart caddy || true
-
-    echo "✅ Alte Installation wurde entfernt."
-  else
-    echo "❌ Abgebrochen. Bitte Script beenden oder manuell bereinigen."
-    exit 1
+  fi
+fi
+if [ -d /opt/opencloud-compose ]; then
+  echo "⚠️  Es gibt ein Verzeichnis /opt/opencloud-compose (Full-Setup)."
+  if confirm "❓ Full-Setup stoppen & entfernen (docker compose down)?"; then
+    (cd /opt/opencloud-compose && sudo docker compose down --remove-orphans || true)
+    sudo rm -rf /opt/opencloud-compose || true
   fi
 fi
 
-# Auswahl
-echo
-echo "1) Minimal (Rolling, lokal über Caddy)"
-echo "2) Voll (opencloud_full mit Domains und Traefik)"
-read -rp "Wähle Version (1/2): " MODE
+# ---------- packages ----------
+echo "📦 Installiere Abhängigkeiten (Docker, Compose v2, Caddy, Git, curl, gpg, ca-certificates) ..."
+sudo apt-get update -y
+sudo apt-get install -y curl git gnupg2 ca-certificates docker.io docker-compose-plugin
 
-read -rp "📍 Server-IP oder Hostname (für Zertifikate/Domains): " HOST
+# Docker-Dienst sicher starten
+sudo systemctl enable --now docker
 
-# Pakete + Caddy-Repo
-echo "📦 Installiere Abhängigkeiten..."
-
-sudo apt update
-sudo apt install -y curl git gnupg2 docker.io docker-compose debian-keyring debian-archive-keyring
-
-if ! command -v caddy >/dev/null 2>&1; then
-  echo "➕ Füge offizielles Caddy-Repository hinzu..."
-  curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
-  curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | \
-    sed 's#^deb #deb [signed-by=/usr/share/keyrings/caddy-stable-archive-keyring.gpg] #' | \
-    sudo tee /etc/apt/sources.list.d/caddy-stable.list > /dev/null
-  sudo apt update
-  sudo apt install -y caddy
+# Compose v2 Check (wichtig!)
+if ! docker compose version >/dev/null 2>&1; then
+  echo "❌ 'docker compose' (v2) nicht gefunden. Bitte Docker laut offizieller Anleitung installieren."
+  exit 1
 fi
 
-# MINIMAL
+echo
+echo "🔧 Modus wählen:"
+echo "  1) Minimal (ein Host/FQDN, Caddy als Reverse-Proxy, interner 9200)"
+echo "  2) Full (Traefik + Collabora via opencloud-compose, produktionsfähig)"
+read -rp "Auswahl (1/2): " MODE
+
+if [[ "${MODE:-}" != "1" && "${MODE:-}" != "2" ]]; then
+  echo "❌ Ungültige Auswahl."
+  exit 1
+fi
+
 if [[ "$MODE" == "1" ]]; then
-  echo "🎯 Starte Minimal-Setup..."
+  # ---------- Minimal mit Caddy ----------
+  read -rp "🌐 FQDN (z. B. cloud.example.com): " FQDN
+  read -rsp "🔐 Admin-Passwort (für OpenCloud 'admin'): " ADM_PW; echo
+  echo
+  echo "🛡️  TLS-Variante wählen:"
+  echo "  - Öffentlich (Let's Encrypt automatisch, empfohlen)"
+  echo "  - Intern (Caddys 'tls internal' – nur Lab/ohne echte Domain)"
+  confirm "👉 Internes TLS verwenden?" && TLS_INTERNAL=true || TLS_INTERNAL=false
 
-  sudo mkdir -p /opt/opencloud && cd /opt/opencloud
+  # Caddy installieren (falls fehlt)
+  if ! need_cmd caddy; then
+    echo "➕ Installiere Caddy Repo & Paket ..."
+    curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | \
+      sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+    curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | \
+      sed 's#^deb #deb [signed-by=/usr/share/keyrings/caddy-stable-archive-keyring.gpg] #' | \
+      sudo tee /etc/apt/sources.list.d/caddy-stable.list >/dev/null
+    sudo apt-get update -y
+    sudo apt-get install -y caddy
+  fi
 
-  cat <<EOF | sudo tee docker-compose.yml
-version: '3.3'
+  echo "📁 Erzeuge Compose-Stack unter /opt/opencloud ..."
+  sudo mkdir -p /opt/opencloud
+  cd /opt/opencloud
+
+  cat <<EOF | sudo tee docker-compose.yml >/dev/null
+version: "3.9"
 services:
-  opencloud-rolling:
+  opencloud:
+    image: opencloudeu/opencloud-rolling:latest
     container_name: opencloud
-    image: opencloudeu/opencloud-rolling
-    volumes:
-      - opencloud-data:/var/lib/opencloud
-      - opencloud-config:/etc/opencloud
+    restart: unless-stopped
     ports:
-      - 127.0.0.1:9200:9200
-    entrypoint: [ "/bin/sh" ]
-    command: ["-c", "opencloud init --insecure true || true; opencloud server"]
+      - "127.0.0.1:9200:9200"
+    volumes:
+      - opencloud-config:/etc/opencloud
+      - opencloud-data:/var/lib/opencloud
     environment:
-      - IDM_CREATE_DEMO_USERS=false
-      - OC_URL=https://$HOST
+      - OC_INSECURE=true
+      - PROXY_HTTP_ADDR=0.0.0.0:9200
+      - OC_URL=https://${FQDN}
+    entrypoint: ["/bin/sh","-c"]
+    command:
+      - |
+        opencloud init --insecure true --admin-password '${ADM_PW}' || true
+        exec opencloud server
 volumes:
-  opencloud-data:
   opencloud-config:
+  opencloud-data:
 EOF
 
+  echo "🚀 Starte OpenCloud (Minimal) ..."
   sudo docker compose up -d
 
-  cat <<EOF | sudo tee /etc/caddy/Caddyfile
-$HOST {
+  echo "📝 Schreibe Caddyfile ..."
+  if $TLS_INTERNAL; then
+    cat <<EOF | sudo tee /etc/caddy/Caddyfile >/dev/null
+${FQDN} {
   tls internal
   encode gzip
   reverse_proxy https://127.0.0.1:9200 {
@@ -91,45 +123,69 @@ $HOST {
   }
 }
 EOF
+  else
+    # Öffentliches TLS: Caddy holt automatisch Let's Encrypt
+    cat <<EOF | sudo tee /etc/caddy/Caddyfile >/dev/null
+${FQDN} {
+  encode gzip
+  reverse_proxy https://127.0.0.1:9200 {
+    transport http {
+      tls_insecure_skip_verify
+    }
+  }
+}
+EOF
+  fi
 
   sudo systemctl enable --now caddy
-  sudo systemctl restart caddy
-  echo "✅ Minimal-Setup abgeschlossen: https://$HOST"
+  sudo systemctl reload caddy || sudo systemctl restart caddy
 
-# FULL
+  echo
+  echo "✅ Fertig! Öffne: https://${FQDN}"
+  echo "   Login: admin / (dein Passwort)"
+  echo "   Logs:  sudo docker logs -f opencloud"
+
 else
-  echo "🎯 Starte Voll-Setup..."
+  # ---------- Full mit Traefik & Collabora ----------
+  read -rp "🌐 Basis-Domain (z. B. example.com): " BASE_DOMAIN
+  read -rsp "🔐 INITIAL_ADMIN_PASSWORD (OpenCloud 'admin'): " INITIAL_ADMIN_PASSWORD; echo
+  read -rp "📧 E-Mail für Let's Encrypt (Traefik): " LE_MAIL
 
-  cd ~
-  git clone https://github.com/opencloud-eu/opencloud.git || {
-    echo "❌ Fehler beim Klonen des Repos"
-    exit 1
-  }
+  export OC_DOMAIN="cloud.${BASE_DOMAIN}"
+  export COLLABORA_DOMAIN="collabora.${BASE_DOMAIN}"
+  export WOPISERVER_DOMAIN="wopiserver.${BASE_DOMAIN}"
+  export KEYCLOAK_DOMAIN="keycloak.${BASE_DOMAIN}"
 
-  cd opencloud/deployments/examples/opencloud_full
-  cp .env.example .env
+  echo "📁 Klone opencloud-compose nach /opt/opencloud-compose ..."
+  sudo rm -rf /opt/opencloud-compose || true
+  sudo git clone https://github.com/opencloud-eu/opencloud-compose.git /opt/opencloud-compose
+  cd /opt/opencloud-compose
+  sudo cp .env.example .env
 
-  sed -i "s/cloud.YOUR.DOMAIN/cloud.$HOST/g" .env
-  sed -i "s/TRAEFIK_ACME_MAIL=.*/TRAEFIK_ACME_MAIL=admin@$HOST/" .env
-  read -rp "🔐 Admin Passwort setzen (in .env): " ADM_PW
-  sed -i "s/ADMIN_PASSWORD=.*/ADMIN_PASSWORD=$ADM_PW/" .env
+  echo "✍️  Setze .env Variablen ..."
+  sudo sed -i -E "s|^OC_DOMAIN=.*|OC_DOMAIN=${OC_DOMAIN}|g" .env
+  sudo sed -i -E "s|^COLLABORA_DOMAIN=.*|COLLABORA_DOMAIN=${COLLABORA_DOMAIN}|g" .env
+  sudo sed -i -E "s|^WOPISERVER_DOMAIN=.*|WOPISERVER_DOMAIN=${WOPISERVER_DOMAIN}|g" .env
+  sudo sed -i -E "s|^KEYCLOAK_DOMAIN=.*|KEYCLOAK_DOMAIN=${KEYCLOAK_DOMAIN}|g" .env
+  sudo sed -i -E "s|^INITIAL_ADMIN_PASSWORD=.*|INITIAL_ADMIN_PASSWORD=${INITIAL_ADMIN_PASSWORD}|g" .env
+  sudo sed -i -E "s|^TRAEFIK_LETSENCRYPT_EMAIL=.*|TRAEFIK_LETSENCRYPT_EMAIL=${LE_MAIL}|g" .env
 
-  sed -i "s/COLLABORA_DOMAIN=.*/COLLABORA_DOMAIN=collabora.$HOST/" .env
-  sed -i "s/WOPISERVER_DOMAIN=.*/WOPISERVER_DOMAIN=wopiserver.$HOST/" .env
-  sed -i "s/TRAEFIK_DOMAIN=.*/TRAEFIK_DOMAIN=traefik.$HOST/" .env
+  # Volle Auswahl: Core + Collabora + Traefik (OpenCloud & Collabora)
+  if grep -q '^#\?COMPOSE_FILE=' .env; then
+    sudo sed -i -E \
+      "s|^#?COMPOSE_FILE=.*|COMPOSE_FILE=docker-compose.yml:weboffice/collabora.yml:traefik/opencloud.yml:traefik/collabora.yml|g" .env
+  else
+    echo "COMPOSE_FILE=docker-compose.yml:weboffice/collabora.yml:traefik/opencloud.yml:traefik/collabora.yml" | sudo tee -a .env >/dev/null
+  fi
 
-  # Optionale Hosts-Datei
-  sudo tee -a /etc/hosts <<EOF
-127.0.0.1 cloud.$HOST
-127.0.0.1 traefik.$HOST
-127.0.0.1 collabora.$HOST
-127.0.0.1 wopiserver.$HOST
-EOF
-
-  echo "🔍 .env ist konfiguriert – starte Deployment"
+  echo "🚀 Starte OpenCloud (Full) ..."
   sudo docker compose up -d
-  echo "✅ Voll-Setup läuft unter: https://cloud.$HOST"
-fi
 
-echo
-echo "ℹ️ Logs anzeigen: sudo docker logs -f opencloud"
+  echo
+  echo "✅ Fertig! Haupt-URL: https://${OC_DOMAIN}"
+  echo "   Collabora:         https://${COLLABORA_DOMAIN}"
+  echo "   WOPI Server:       https://${WOPISERVER_DOMAIN}"
+  echo "   Keycloak:          https://${KEYCLOAK_DOMAIN}"
+  echo "   Login: admin / (dein INITIAL_ADMIN_PASSWORD)"
+  echo "   Logs:  sudo docker compose logs -f"
+fi
